@@ -7,9 +7,9 @@
 namespace firenet {
 namespace upd {
 
-struct Version { int major = 0, minor = 0, patch = 0; bool alpha = false, ok = false; };
+struct Version { int major = 0, minor = 0, patch = 0; bool ok = false; };
 
-// "4.3.1" or "v4.3.1", optionally with the project's trailing "a" preview suffix.
+// "4.3.1" or "v4.3.1"; anything else (pre-release suffix, missing part, extra text) is refused.
 inline Version parseVersion(const std::string& s) {
   Version v; size_t i = (!s.empty() && s[0] == 'v') ? 1 : 0;
   int* part[3] = {&v.major, &v.minor, &v.patch};
@@ -20,13 +20,12 @@ inline Version parseVersion(const std::string& s) {
     *part[p] = atoi(s.substr(st, i - st).c_str());
     if (p < 2) { if (i >= s.size() || s[i] != '.') return Version(); i++; }
   }
-  if (i < s.size() && s[i] == 'a') { v.alpha = true; i++; }
   if (i != s.size()) return Version();
   v.ok = true;
   return v;
 }
 
-// The version a signed trusted comment announces: it must read exactly "Release vX.Y.Z[a]".
+// The version a signed trusted comment announces: it must read exactly "Release vX.Y.Z".
 inline Version versionFromComment(const std::string& comment) {
   static const char P[] = "Release ";
   if (comment.compare(0, sizeof P - 1, P) != 0) return Version();
@@ -40,8 +39,7 @@ inline bool isNewer(const Version& cand, const Version& cur) {
   if (!cand.ok || !cur.ok) return false;
   if (cand.major != cur.major) return cand.major > cur.major;
   if (cand.minor != cur.minor) return cand.minor > cur.minor;
-  if (cand.patch != cur.patch) return cand.patch > cur.patch;
-  return cur.alpha && !cand.alpha;
+  return cand.patch > cur.patch;
 }
 
 // Installing restarts the bridge, so it is only allowed while the stove is switched off. "standby" is a stove that is

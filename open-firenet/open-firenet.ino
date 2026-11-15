@@ -29,11 +29,11 @@
 #include "firenet_link_v0.h"
 #include "firenet_v0_map.h"
 #include "firenet_api.h"
-#include "firenet_hcsr04.h"
 #include "firenet_web_guard.h"
 #include "firenet_crash.h"
 #include "esp_core_dump.h"   // summary of the last crash, left in flash by the chip
 #include "esp_app_desc.h"
+#include "firenet_mac.h"
 #include "mbedtls/sha256.h"
 #include "firenet_mqtt.h"
 #include <deque>
@@ -41,9 +41,11 @@
 static firenet::DisplayConfig g_dispCfg;   // which screens the small display shows, and in which order
 #include "firenet_display.h"
 static firenet::Display g_display;
-// The screen is driven only on the board the owner chose ("tdongle"), never by guesswork: other boards may have something
-// else on those pins. Stored in flash, applied at the next restart. A build with -DFIRENET_DISPLAY_TDONGLE=1 starts with it on.
-#if defined(FIRENET_DISPLAY_TDONGLE)
+// The screen is driven only on the board the owner chose ("tdongle" or "pocket_dongle"), never by guesswork: other boards may have something
+// else on those pins. Stored in flash, applied at the next restart.
+#if defined(FIRENET_DISPLAY_POCKET_DONGLE)
+static const char* const kDefaultBoard = "pocket_dongle";
+#elif defined(FIRENET_DISPLAY_TDONGLE)
 static const char* const kDefaultBoard = "tdongle";
 #else
 static const char* const kDefaultBoard = "none";
@@ -54,6 +56,7 @@ static String g_dispBootBoard = kDefaultBoard; // the choice the running firmwar
 #include "mqtt_client.h"   // esp-mqtt, Espressif's MQTT client shipped with the ESP32 core
 #include "esp_crt_bundle.h" // public certificate authorities, to verify a broker reached over TLS
 #include "web_ui.h"
+
 
 // Types used in function signatures are declared here, ahead of every function: the Arduino builder inserts its
 // generated prototypes before the first function of the sketch.
@@ -84,7 +87,6 @@ struct Hcsr04Config {
   bool enabled = false;
   int triggerPin = 16, echoPin = 17;
   int minHeightCm = 0, maxHeightCm = 100, alertHeightCm = 10;
-  int fullDistanceCm = 2;
 };
 struct Hcsr04Reading {
   bool valid = false, alert = false;
@@ -93,8 +95,6 @@ struct Hcsr04Reading {
 };
 static Hcsr04Config g_hcsr04Cfg;
 static Hcsr04Reading g_hcsr04Reading;
-static bool g_hcsr04LidOpen = false;
-static uint32_t g_hcsr04ConfigGeneration = 0;
 static portMUX_TYPE g_hcsr04Mux = portMUX_INITIALIZER_UNLOCKED;
 static bool g_hcsr04TaskStarted = false;
 
@@ -108,41 +108,16 @@ static bool hcsr04PinValid(int pin, bool output) {
 
 static void hcsr04Task(void*) {
   int activeTrigger = -1, activeEcho = -1;
-  uint32_t activeConfigGeneration = 0;
-  Hcsr04Reading acceptedReading;
-  firenet::Hcsr04ReadingFilter readingFilter;
   for (;;) {
     Hcsr04Config cfg;
-    bool lidOpen;
-    uint32_t configGeneration;
     portENTER_CRITICAL(&g_hcsr04Mux);
     cfg = g_hcsr04Cfg;
-    lidOpen = g_hcsr04LidOpen;
-    configGeneration = g_hcsr04ConfigGeneration;
     portEXIT_CRITICAL(&g_hcsr04Mux);
-
-    if (configGeneration != activeConfigGeneration) {
-      readingFilter.reset();
-      acceptedReading = Hcsr04Reading{};
-      activeConfigGeneration = configGeneration;
-    }
 
     if (!cfg.enabled) {
       if (activeTrigger >= 0) pinMode(activeTrigger, INPUT);
       if (activeEcho >= 0 && activeEcho != activeTrigger) pinMode(activeEcho, INPUT);
       activeTrigger = activeEcho = -1;
-      readingFilter.reset();
-      acceptedReading = Hcsr04Reading{};
-      portENTER_CRITICAL(&g_hcsr04Mux);
-      g_hcsr04Reading = Hcsr04Reading{};
-      portEXIT_CRITICAL(&g_hcsr04Mux);
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      continue;
-    }
-
-    if (lidOpen) {
-      if (activeTrigger >= 0) digitalWrite(activeTrigger, LOW);
-      readingFilter.clearCandidate();
       portENTER_CRITICAL(&g_hcsr04Mux);
       g_hcsr04Reading = Hcsr04Reading{};
       portEXIT_CRITICAL(&g_hcsr04Mux);
@@ -173,18 +148,12 @@ static void hcsr04Task(void*) {
       reading.distanceCm = distance;
       reading.heightCm = constrain((float)cfg.maxHeightCm - distance,
                                    (float)cfg.minHeightCm, (float)cfg.maxHeightCm);
-      reading.fillPercent = firenet::hcsr04FillPercent(distance, cfg.fullDistanceCm, cfg.maxHeightCm);
+      reading.fillPercent = (int)lroundf((reading.heightCm - cfg.minHeightCm) * 100.0f /
+                                         (cfg.maxHeightCm - cfg.minHeightCm));
       reading.alert = reading.heightCm <= cfg.alertHeightCm;
     }
     portENTER_CRITICAL(&g_hcsr04Mux);
-    if (g_hcsr04ConfigGeneration != configGeneration || g_hcsr04LidOpen) {
-      if (g_hcsr04LidOpen) readingFilter.clearCandidate();
-      g_hcsr04Reading = Hcsr04Reading{};
-    } else {
-      if (reading.valid && readingFilter.accept(reading.distanceCm)) acceptedReading = reading;
-      else if (!reading.valid) readingFilter.clearCandidate();
-      g_hcsr04Reading = acceptedReading;
-    }
+    g_hcsr04Reading = reading;
     portEXIT_CRITICAL(&g_hcsr04Mux);
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
@@ -198,7 +167,7 @@ SET_LOOP_TASK_STACK_SIZE(12 * 1024);   // loop() was left with 1.3 kB of its 8 k
 
 // --------------------------------------------------------- version & config USB
 #ifndef OPENFIRENET_VERSION
-#define OPENFIRENET_VERSION "4.9.2a"
+#define OPENFIRENET_VERSION "5.1.0"
 #endif
 
 // Identifiants USB Open Firenet
@@ -334,10 +303,30 @@ static const char* rikaModelName(long modelId) {
     default: return "RIKA";
   }
 }
-// fabNumber is the make the stove is set to ("Fabrikat": 1 = RIKA, 2 = ANIMO). Model 5 sold by ANIMO is the PURE (seen on a
-// 2.29 stove, issue #112); the other ANIMO models are not known by name yet, so they keep the RIKA name of their number.
+// ANIMO, RIKA's second make, numbers its models on its own, from 1: the ANIMO part of the model table of RIKA's
+// ComponentTest firmware 2.29 (AVITO, AVSLM, AVRAO, ADEVO, PURE, ADUO, AMITO, ARND, ADUO_2). Model 5 is the PURE of
+// issue #112.
+static const char* animoModelName(long modelId) {
+  switch (modelId) {
+    case 1: return "AVITO";
+    case 2: return "AVITO SLIM";
+    case 3: return "AVITO RAO";
+    case 4: return "ADEVO";
+    case 5: return "PURE";
+    case 6: return "ADUO";
+    case 7: return "AMITO";
+    case 8: return "ARONDO";
+    case 9: return "ADUO 2";
+    default: return nullptr;
+  }
+}
+// fabNumber is the make the stove is set to ("Fabrikat": 1 = RIKA, 2 = ANIMO). An ANIMO model missing from the table keeps
+// the RIKA name of its number.
 static const char* getStoveModelName(long modelId, long make = 1) {
-  if (make == 2 && modelId == 5) return "PURE";
+  if (make == 2) {
+    const char* animo = animoModelName(modelId);
+    if (animo) return animo;
+  }
   return rikaModelName(modelId);
 }
 static const char* getStoveBrand(long make) { return make == 2 ? "ANIMO" : "RIKA"; }
@@ -599,7 +588,7 @@ static String jsonState() {
   const char* stName; const char* stLabel; bool isBurning;
   mainStateNames(sensorValue(m, "mainState", 1), sensorValue(m, "subState", 0), sensorValue(m, "flame", 0), stName, stLabel, isBurning);
 
-  char buf[600];
+  char buf[700];
   snprintf(buf, sizeof(buf),
     "{"
     "\"device\":{"
@@ -607,6 +596,12 @@ static String jsonState() {
       "\"version\":\"" OPENFIRENET_VERSION "\","
       "\"app_version\":\"" OPENFIRENET_VERSION "\","
       "\"firmware_version\":\"" OPENFIRENET_VERSION "\","
+      "\"firmware_variant\":\"%s\","
+      "\"hardware_psram\":%s,"
+      "\"hardware_psram_size\":%u,"
+      "\"psram_build_supported\":%s,"
+      "\"psram_size\":%u,"
+      "\"free_psram\":%u,"
       "\"ip\":\"%s\","
       "\"mac\":\"%s\","
       "\"wifi_ssid\":\"%s\","
@@ -617,8 +612,14 @@ static String jsonState() {
       "\"ota_password_set\":%s,"
       "\"connected\":%s"
     "},",
+      psramFound() ? "psram" : "standard",
+      firenet::hasHardwarePsram() ? "true" : "false",
+      (unsigned)firenet::hardwarePsramBytes(),
+      firenet::hasOctalPsram() ? "true" : "false",
+      psramFound() ? (unsigned)ESP.getPsramSize() : 0,
+      psramFound() ? (unsigned)ESP.getFreePsram() : 0,
     (g_isApMode?WiFi.softAPIP():WiFi.localIP()).toString().c_str(),
-    WiFi.macAddress().c_str(),
+    stationMac().c_str(),
     jsonEscape(WiFi.SSID()).c_str(),   // a network name may contain quotes
     WiFi.RSSI(),
     millis() / 1000UL,
@@ -1002,16 +1003,31 @@ static bool applySetOtaPass(const String& line, Print& out) {
   return true;
 }
 
-// SETDISPLAY:none | SETDISPLAY:tdongle   chooses the board whose screen is driven; applied at the next restart. The way back
-// when a screen was switched on by mistake on a board that has none.
+// SETDISPLAY:none | SETDISPLAY:tdongle | SETDISPLAY:pocket_dongle   chooses the board whose screen is driven; applied at the next restart.
+// The way back when a screen was switched on by mistake on a board that has none.
 static bool applySetDisplay(const String& line, Print& out) {
   if (!line.startsWith("SETDISPLAY:")) return false;
   String b = line.substring(11); b.trim();
   bool ok = firenet::DisplayConfig::validBoard(b.c_str());
   if (ok) { g_dispBoard = b; prefs.begin("firenet", false); prefs.putString("disp_board", g_dispBoard); prefs.end(); }
-  const char* msg = ok ? "[display] SETDISPLAY OK, effective after restart" : "[display] SETDISPLAY: none or tdongle";
+  const char* msg = ok ? "[display] SETDISPLAY OK, effective after restart" : "[display] SETDISPLAY: none, tdongle or pocket_dongle";
   DBG.println(msg);
   if ((Print*)&out != (Print*)&DBG) { out.print(msg); out.print("\r\n"); out.flush(); }
+  return true;
+}
+
+// GETINFO  returns the dongle's MAC, local IP and firmware version over the serial port.
+static bool applyGetInfo(const String& line, Print& out) {
+  if (line != "GETINFO" && line != "GETINFO:") return false;
+  String mac = stationMac();
+  String ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "";
+  String msg = String("[info] MAC=") + mac + " IP=" + ip + " VER=" + OPENFIRENET_VERSION;
+  DBG.println(msg);
+  if ((Print*)&out != (Print*)&DBG) {
+    out.print(msg);
+    out.print("\r\n");
+    out.flush();
+  }
   return true;
 }
 
@@ -1049,7 +1065,7 @@ static void handleSerialProvisioning() {
     char c = (char)DBG.read();
     if (c == '\n' || c == '\r') {
       if (dbgLine.length() > 0) {
-        if (!applySetOtaPass(dbgLine, DBG) && !applySetDisplay(dbgLine, DBG)) applySetWifi(dbgLine, DBG);
+        if (!applyGetInfo(dbgLine, DBG) && !applySetOtaPass(dbgLine, DBG) && !applySetDisplay(dbgLine, DBG)) applySetWifi(dbgLine, DBG);
         dbgLine = "";
       }
     } else if (dbgLine.length() < 160) {
@@ -1065,15 +1081,17 @@ static void handleSerialProvisioning() {
     char c = (char)b;
     if (c == '\n' || c == '\r') {
       if (stoveLine.length() > 0) {
-        if (!applySetOtaPass(stoveLine, STOVE) && !applySetDisplay(stoveLine, STOVE)) applySetWifi(stoveLine, STOVE);
+        if (!applyGetInfo(stoveLine, STOVE) && !applySetOtaPass(stoveLine, STOVE) && !applySetDisplay(stoveLine, STOVE)) applySetWifi(stoveLine, STOVE);
         stoveLine = "";
       }
     } else {
       if (stoveLine.length() == 0) {
-        if (c == 'S') stoveLine += c;
+        if (c == 'S' || c == 'G') stoveLine += c;
       } else if (stoveLine.length() < 160) {
         stoveLine += c;
-        if (stoveLine.length() == 8 && stoveLine != "SETWIFI:" && stoveLine != "SETOTAPA") {
+        if (stoveLine.length() == 7 && stoveLine.startsWith("GETINFO")) {
+          // command matches
+        } else if (stoveLine.length() == 8 && stoveLine != "SETWIFI:" && stoveLine != "SETOTAPA" && !stoveLine.startsWith("GETINFO")) {
           stoveLine = "";
         }
       }
@@ -1144,9 +1162,9 @@ static void handleScan() {
 // 32 KB: the ring is reserved in RAM at boot, so it is taken from the free memory at all times. 96 KB left a DOMO
 // 2.29 with only ~25 KB of free heap at its lowest; 48 KB left 14 KB during a TLS connection to an MQTT broker.
 // Repeated lines are merged, so 32 KB still holds a few minutes of normal traffic.
-// The history of the exchanges with the stove: 16 kB by default, 32 kB when the owner asks for it (Bridge > System). It is allocated
+// The history of the exchanges with the stove: 16 kB by default (256 kB when PSRAM is present), 32 kB when the owner asks for it (Bridge > System). It is allocated
 // at start, so a change applies at the next restart; when the memory is not there, the smaller size is used.
-static const size_t LOG_RING_SMALL = 16 * 1024, LOG_RING_LARGE = 32 * 1024;
+static const size_t LOG_RING_SMALL = 16 * 1024, LOG_RING_LARGE = 32 * 1024, LOG_RING_PSRAM = 256 * 1024;
 static char*    g_logRing = nullptr;
 static size_t   g_logSize = 0;               // bytes of g_logRing, 0 until allocated
 static size_t   g_logWantedKb = 16;          // the stored choice
@@ -1158,8 +1176,15 @@ static uint32_t g_pendCount = 0, g_pendLastMs = 0;
 
 static void logRingBegin() {
   Preferences lp; lp.begin("firenet", true);
-  g_logWantedKb = lp.getUChar("log_kb", 16) == 32 ? 32 : 16;
+  uint16_t stored = lp.getUShort("log_kb", lp.getUChar("log_kb", 0));
   lp.end();
+  if (psramFound()) {
+    g_logWantedKb = (stored == 16 || stored == 32 || stored == 256) ? stored : 256;
+    size_t want = g_logWantedKb * 1024;
+    g_logRing = (char*)ps_malloc(want);
+    if (g_logRing) { g_logSize = want; return; }
+  }
+  g_logWantedKb = (stored == 32) ? 32 : 16;
   size_t want = g_logWantedKb == 32 ? LOG_RING_LARGE : LOG_RING_SMALL;
   g_logRing = (char*)malloc(want);
   g_logSize = g_logRing ? want : 0;
@@ -1334,7 +1359,6 @@ static void handleHcsr04() {
       else if (p.first == "min_height_cm") valid = parseHcsr04Int(text, cfg.minHeightCm);
       else if (p.first == "max_height_cm") valid = parseHcsr04Int(text, cfg.maxHeightCm);
       else if (p.first == "alert_height_cm") valid = parseHcsr04Int(text, cfg.alertHeightCm);
-      else if (p.first == "full_distance_cm") valid = parseHcsr04Int(text, cfg.fullDistanceCm);
       if (!valid) {
         web.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid parameter value\"}");
         return;
@@ -1345,15 +1369,14 @@ static void handleHcsr04() {
       return;
     }
     if (cfg.minHeightCm >= cfg.maxHeightCm || cfg.maxHeightCm > 400 ||
-        cfg.fullDistanceCm >= cfg.maxHeightCm ||
         cfg.alertHeightCm < cfg.minHeightCm || cfg.alertHeightCm > cfg.maxHeightCm) {
-      web.send(400, "application/json", "{\"ok\":false,\"error\":\"heights must satisfy min <= alert <= max <= 400 cm and full distance < max\"}");
+      web.send(400, "application/json", "{\"ok\":false,\"error\":\"heights must satisfy min <= alert <= max and max <= 400 cm\"}");
       return;
     }
 
-    char serialized[64];
-    snprintf(serialized, sizeof(serialized), "%d,%d,%d,%d,%d,%d,%d", cfg.enabled ? 1 : 0, cfg.triggerPin,
-             cfg.echoPin, cfg.minHeightCm, cfg.maxHeightCm, cfg.alertHeightCm, cfg.fullDistanceCm);
+    char serialized[48];
+    snprintf(serialized, sizeof(serialized), "%d,%d,%d,%d,%d,%d", cfg.enabled ? 1 : 0, cfg.triggerPin,
+             cfg.echoPin, cfg.minHeightCm, cfg.maxHeightCm, cfg.alertHeightCm);
     prefs.begin("firenet", false);
     const bool saved = prefs.getString("hcsr_cfg", "") == serialized || prefs.putString("hcsr_cfg", serialized) != 0;
     prefs.end();
@@ -1363,26 +1386,20 @@ static void handleHcsr04() {
     }
     portENTER_CRITICAL(&g_hcsr04Mux);
     g_hcsr04Cfg = cfg;
-    g_hcsr04Reading = Hcsr04Reading{};
-    g_hcsr04ConfigGeneration++;
     portEXIT_CRITICAL(&g_hcsr04Mux);
   }
 
   Hcsr04Config cfg;
   Hcsr04Reading reading;
-  bool lidOpen;
   portENTER_CRITICAL(&g_hcsr04Mux);
   cfg = g_hcsr04Cfg;
   reading = g_hcsr04Reading;
-  lidOpen = g_hcsr04LidOpen;
   portEXIT_CRITICAL(&g_hcsr04Mux);
   String json = String("{\"ok\":true,\"task_ready\":") + (g_hcsr04TaskStarted ? "true" : "false")
     + ",\"enabled\":" + (cfg.enabled ? "true" : "false")
-    + ",\"lid_open\":" + (lidOpen ? "true" : "false")
     + ",\"trigger_pin\":" + cfg.triggerPin + ",\"echo_pin\":" + cfg.echoPin
     + ",\"min_height_cm\":" + cfg.minHeightCm + ",\"max_height_cm\":" + cfg.maxHeightCm
-    + ",\"alert_height_cm\":" + cfg.alertHeightCm + ",\"full_distance_cm\":" + cfg.fullDistanceCm
-    + ",\"valid\":" + (reading.valid ? "true" : "false")
+    + ",\"alert_height_cm\":" + cfg.alertHeightCm + ",\"valid\":" + (reading.valid ? "true" : "false")
     + ",\"distance_cm\":" + (reading.valid ? String(reading.distanceCm, 1) : String("null"))
     + ",\"height_cm\":" + (reading.valid ? String(reading.heightCm, 1) : String("null"))
     + ",\"fill_percent\":" + (reading.valid ? String(reading.fillPercent) : String("null"))
@@ -2084,7 +2101,7 @@ static void handleLog() {
   web.sendContent("");
 }
 
-// GET/POST /api/log_size {"kb":16|32} -> the size of the history of the exchanges with the stove. Stored; applied at the next restart.
+// GET/POST /api/log_size {"kb":16|32|256} -> the size of the history of the exchanges with the stove. Stored; applied at the next restart.
 static void handleLogSize() {
   if (web.method() == HTTP_POST) {
     std::vector<std::pair<std::string, std::string>> kv;
@@ -2092,14 +2109,16 @@ static void handleLogSize() {
     for (int i = 0; i < web.args(); i++) if (web.argName(i) != "plain") kv.push_back({web.argName(i).c_str(), web.arg(i).c_str()});
     for (const auto& p : kv) if (p.first == "kb") {
       int kb = atoi(p.second.c_str());
-      if (kb != 16 && kb != 32) { web.send(400, "application/json", "{\"ok\":false,\"error\":\"kb must be 16 or 32\"}"); return; }
+      bool ok = (kb == 16 || kb == 32 || (psramFound() && kb == 256));
+      if (!ok) { web.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid kb\"}"); return; }
       g_logWantedKb = (size_t)kb;
-      Preferences lp; lp.begin("firenet", false); lp.putUChar("log_kb", (uint8_t)kb); lp.end();
+      Preferences lp; lp.begin("firenet", false); lp.putUShort("log_kb", (uint16_t)kb); lp.end();
     }
   }
   size_t running = g_logSize / 1024;
+  String opts = psramFound() ? "[16,32,256]" : "[16,32]";
   web.send(200, "application/json", String("{\"ok\":true,\"kb\":") + (unsigned)g_logWantedKb + ",\"running_kb\":" + (unsigned)running +
-           ",\"options\":[16,32],\"restart_needed\":" + (running != g_logWantedKb ? "true" : "false") + "}");
+           ",\"options\":" + opts + ",\"restart_needed\":" + (running != g_logWantedKb ? "true" : "false") + "}");
 }
 
 // --------------------------------------------------------------------- setup
@@ -2110,13 +2129,34 @@ void setup() {
     g_dispBoard = p.getString("disp_board", kDefaultBoard);
     p.end();
     g_dispBootBoard = g_dispBoard;
-    if (g_dispBoard == "tdongle") { g_dispActive = true; g_display.start(); }   // first, so that the logo shows while the rest starts
-    else if (g_dispBoard == "tdongle_off") g_display.blank();
+    g_display.setBoard(g_dispBoard.c_str());
+    if (g_dispBoard == "tdongle" || g_dispBoard == "pocket_dongle") {
+      g_dispActive = true;
+      g_display.start();   // first, so that the logo shows while the rest starts
+    } else if (g_dispBoard == "tdongle_off" || g_dispBoard == "pocket_dongle_off") {
+      g_display.blank();
+    }
   }
   readRestartReason();
   loadCrashInfo();
   DBG.begin(115200);
   DBG.println("\n[Open Firenet] boot");
+  if (psramFound()) {
+    char b[64];
+    snprintf(b, sizeof(b), "PSRAM: %u KB total, %u KB free", (unsigned)(ESP.getPsramSize() / 1024), (unsigned)(ESP.getFreePsram() / 1024));
+    logEntry("sys", b);
+    DBG.println(b);
+  } else if (firenet::hasHardwarePsram()) {
+    char b[80];
+    snprintf(b, sizeof(b), firenet::hasOctalPsram() ? "PSRAM: %u KB detected via eFuse (standard build)"
+                                                    : "PSRAM: %u KB quad, not supported (standard build)",
+             (unsigned)(firenet::hardwarePsramBytes() / 1024));
+    logEntry("sys", b);
+    DBG.println(b);
+  } else {
+    logEntry("sys", "PSRAM: not detected");
+    DBG.println("PSRAM: not detected");
+  }
   buildNames();
 
   // USB CDC avec les identifiants fixés AVANT begin
@@ -2176,15 +2216,12 @@ void setup() {
   if (!hcsr04Saved.isEmpty()) {
     int enabled = 0;
     Hcsr04Config saved;
-    const int savedFields = sscanf(hcsr04Saved.c_str(), "%d,%d,%d,%d,%d,%d,%d", &enabled,
-                                   &saved.triggerPin, &saved.echoPin, &saved.minHeightCm,
-                                   &saved.maxHeightCm, &saved.alertHeightCm, &saved.fullDistanceCm);
-    if ((savedFields == 6 || savedFields == 7) &&
+    if (sscanf(hcsr04Saved.c_str(), "%d,%d,%d,%d,%d,%d", &enabled, &saved.triggerPin, &saved.echoPin,
+               &saved.minHeightCm, &saved.maxHeightCm, &saved.alertHeightCm) == 6 &&
         (enabled == 0 || enabled == 1) &&
         saved.triggerPin != saved.echoPin && hcsr04PinValid(saved.triggerPin, true) &&
         hcsr04PinValid(saved.echoPin, false) && saved.minHeightCm < saved.maxHeightCm &&
-        saved.maxHeightCm <= 400 && saved.fullDistanceCm < saved.maxHeightCm &&
-        saved.alertHeightCm >= saved.minHeightCm &&
+        saved.maxHeightCm <= 400 && saved.alertHeightCm >= saved.minHeightCm &&
         saved.alertHeightCm <= saved.maxHeightCm) {
       saved.enabled = enabled == 1;
       g_hcsr04Cfg = saved;
@@ -2224,7 +2261,7 @@ void setup() {
         if (g_isApMode) g_leaveApMode = true;                // done in loop(), not in the Wi-Fi event task
         DBG.printf("[wifi] GOT_IP %s\n", WiFi.localIP().toString().c_str());
         g_link->setCredentials(wifiSsid.c_str(), wifiPass.c_str(),
-                               WiFi.localIP().toString().c_str(), WiFi.macAddress().c_str());
+                               WiFi.localIP().toString().c_str(), stationMac().c_str());
         if (g_link->model().version_ack) {
           g_link->pushStatus();
         }
@@ -2351,13 +2388,6 @@ void loop() {
   // 1) traiter les trames du poêle
   g_link->poll();
   if (g_v0) { g_v0->poll(g_link->model().version_ack); g_link->setPaused(g_v0->engaged()); }
-  const auto& stoveModel = g_link->model();
-  const bool hopperLidOpen = stoveModel.sensors.count("hopperLidClosed") &&
-                             sensorValue(stoveModel, "hopperLidClosed", 1) == 0;
-  portENTER_CRITICAL(&g_hcsr04Mux);
-  g_hcsr04LidOpen = hopperLidOpen;
-  if (hopperLidOpen) g_hcsr04Reading = Hcsr04Reading{};
-  portEXIT_CRITICAL(&g_hcsr04Mux);
 
   // 1b) Watchdog RX : une fois la version acquittée, le poêle répond en continu
   // (POST_CDCDEVICE_STATUS à chaque cycle). Si plus AUCUN octet reçu pendant
