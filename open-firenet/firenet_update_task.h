@@ -170,7 +170,8 @@ private:
     if (!v.ok) { set(State::Error, "version"); return; }
     std::string h = upd::hashFor(sums, IMAGE_NAME);
     if (h.empty()) { set(State::Error, "no image in release"); return; }
-    std::string vs = std::to_string(v.major) + "." + std::to_string(v.minor) + "." + std::to_string(v.patch);
+    std::string vs = std::to_string(v.major) + "." + std::to_string(v.minor) + "." +
+                     std::to_string(v.patch) + (v.alpha ? "a" : "");
     lock(); latest_ = vs; unlock();
     if (!upd::isNewer(v, upd::parseVersion(current_))) { lock(); hash_.clear(); unlock(); set(State::Idle); return; }
     lock(); hash_ = h; unlock();

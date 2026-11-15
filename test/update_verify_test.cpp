@@ -66,12 +66,17 @@ int main() {
   }
   // Versions.
   CHECK(parseVersion("4.3.1").ok && parseVersion("v4.3.1").ok);
-  CHECK(!parseVersion("4.3").ok && !parseVersion("4.3.1-rc1").ok && !parseVersion("").ok && !parseVersion("4.3.1.2").ok);
+  CHECK(parseVersion("v4.9.2a").ok && parseVersion("v4.9.2a").alpha);
+  CHECK(!parseVersion("4.3").ok && !parseVersion("4.3.1-rc1").ok && !parseVersion("4.9.2A").ok &&
+        !parseVersion("").ok && !parseVersion("4.3.1.2").ok);
   CHECK(!parseVersion("a.b.c").ok && !parseVersion("4..1").ok && !parseVersion("v").ok);
   CHECK(!versionFromComment("Release 4.3.1").ok && !versionFromComment("release v4.3.1").ok && !versionFromComment("Release v4.3.1 extra").ok);
   CHECK(isNewer(parseVersion("4.3.2"), parseVersion("4.3.1")));
   CHECK(isNewer(parseVersion("4.10.0"), parseVersion("4.9.9")));
   CHECK(isNewer(parseVersion("5.0.0"), parseVersion("4.99.99")));
+  CHECK(isNewer(parseVersion("4.9.2a"), parseVersion("4.9.1")));
+  CHECK(isNewer(parseVersion("4.9.2"), parseVersion("4.9.2a")));
+  CHECK(!isNewer(parseVersion("4.9.2a"), parseVersion("4.9.2")));
   CHECK(!isNewer(parseVersion("4.3.1"), parseVersion("4.3.1")));   // same: no update
   CHECK(!isNewer(parseVersion("4.3.0"), parseVersion("4.3.1")));   // older: refused (downgrade)
   CHECK(!isNewer(parseVersion("3.99.99"), parseVersion("4.0.0")));

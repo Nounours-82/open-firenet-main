@@ -1,9 +1,10 @@
 # Changelog
 
-## Non publié
+## v4.9.2a (2026-11-15)
 
 ### Changes
 - Stoves on firmware 2.25: the bridge now sends a start even when the stove is still hot after a stop. The stove waits by itself until it has cooled down enough (139 °C at the flame sensor) before it ignites. Before, the bridge refused the start with "not accepted" until the flame sensor was under 100 °C. (#143)
+- HC-SR04 hopper measurements pause while the pellet hopper lid is open. Fill percentage can be calibrated to the sensor distance when full, and isolated jumps over 10 cm are ignored unless two consecutive readings agree within 2 cm.
 
 ## v4.9.1 (2026-11-03)
 
